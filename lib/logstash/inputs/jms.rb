@@ -7,14 +7,15 @@ require "logstash/namespace"
 #
 # For more information about Jms, see <http://docs.oracle.com/javaee/6/tutorial/doc/bncdq.html>
 # For more information about the Ruby Gem used, see <http://github.com/reidmorrison/jruby-jms>
-# Here is a config example :
+# Here is a config example for a queue :
 #  jms {
 #     include_header => false
 #     include_properties => false
 #     include_body => true
 #     use_jms_timestamp => false
 #     interval => 10
-#     queue_name => "myqueue"
+#     destination => "my.queue.name"
+#     pub-sub => false
 #     yaml_file => "~/jms.yml"
 #     yaml_section => "mybroker"
 #   }
@@ -57,7 +58,7 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
   # This parameter has non influence in the case of a subcribed Topic.
   config :interval, :validate => :number, :default => 10
 
-  # If pub-sub (topic) style should be used or not.
+  # If pub-sub (topic) style should be used .
   config :pub_sub, :validate => :boolean, :default => false
 
   # Name of the destination queue or topic to use.
@@ -137,7 +138,7 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
         if msg.java_kind_of?(JMS::MapMessage)
           event = LogStash::Event.new
           msg.data.each do |field, value|
-            event[field.to_s] = value # TODO(claveau): needs codec.decode or converter.convert ?
+            event.set( field.to_s, value ) # TODO(claveau): needs codec.decode or converter.convert ?
           end
         elsif msg.java_kind_of?(JMS::TextMessage) || msg.java_kind_of?(JMS::BytesMessage)
           @codec.decode(msg.to_s) do |event_message|
@@ -152,18 +153,18 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
 
       # Here, we can use the JMS Enqueue timestamp as the @timestamp
       if @use_jms_timestamp && msg.jms_timestamp
-        event.timestamp = LogStash::Timestamp.at(msg.jms_timestamp / 1000, (msg.jms_timestamp % 1000) * 1000)
+        event.set( "@timestamp", LogStash::Timestamp.at(msg.jms_timestamp / 1000, (msg.jms_timestamp % 1000) * 1000) )
       end
 
       if @include_header
         msg.attributes.each do |field, value|
-          event[field.to_s] = value
+          event.set( field.to_s, value )
         end
       end
 
       if @include_properties
         msg.properties.each do |field, value|
-          event[field.to_s] = value
+          event.set( field.to_s, value )
         end
       end
 
@@ -182,19 +183,18 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
   def run_consumer(output_queue)
     JMS::Connection.session(@jms_config) do |session|
       destination_key = @pub_sub ? :topic_name : :queue_name
-      while(true)
+      while !stop?
         session.consume(destination_key => @destination, :timeout=>@timeout, :selector => @selector) do |message|
           queue_event message, output_queue
+		  break if stop?
         end
         sleep @interval
       end
     end
-  rescue LogStash::ShutdownSignal
-    # Do nothing, let us quit.
   rescue => e
     @logger.warn("JMS Consumer died", :exception => e, :backtrace => e.backtrace)
     sleep(10)
-    retry
+    retry unless stop?
   end # def run
 
   # Consume all available messages on the queue through a listener
@@ -210,16 +210,14 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
       queue_event message, output_queue
     end
     connection.start
-    while(true)
+    while !stop?
       @logger.debug("JMS Thread sleeping ...")
       sleep @interval
     end
-  rescue LogStash::ShutdownSignal
-    connection.close
   rescue => e
     @logger.warn("JMS Consumer died", :exception => e, :backtrace => e.backtrace)
     sleep(10)
-    retry
+    retry unless stop?
   end # def run
 
 
@@ -234,6 +232,7 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
         @logger.warn("JMS Exception has occurred: #{jms_exception}")
         raise jms_exception
       end
+	  
       # Define Asynchronous code block to be called every time a message is received
       destination_key = @pub_sub ? :topic_name : :queue_name
       connection.on_message(destination_key => @destination, :selector => @selector) do |message|
@@ -241,16 +240,15 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
       end
       # Since the on_message handler above is in a separate thread the thread needs
       # to do some other work. It will just sleep for 10 seconds.
-      while(true)
+      while !stop?
+	    @logger.debug("JMS Thread sleeping ...")
         sleep @interval
       end
     end
-  rescue LogStash::ShutdownSignal
-    # Do nothing, let us quit.
   rescue => e
     @logger.warn("JMS Consumer died", :exception => e, :backtrace => e.backtrace)
     sleep(10)
-    retry
+    retry unless stop?
   end # def run
 
 
@@ -266,4 +264,15 @@ class LogStash::Inputs::Jms < LogStash::Inputs::Threadable
     end
   end # def run
 
+  public
+  def close
+    @logger.info("Closing JMS connection")
+    @connection.close rescue nil
+  end # def stop
+  
+  public
+  def stop
+    @logger.info("Stopping JMS consumer")
+	@connection.stop rescue nil
+  end # def stop
 end # class LogStash::Inputs::Jms
